@@ -111,6 +111,40 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     checkAllclose(gres_ref, gres, msg="gemma res check")
 
 
+def test_rmsnorm2d_fuseAdd_residual_unbiased(dtype, m, n):
+    """residual_out must round without a systematic sign.
+
+    A tolerance check cannot catch this: truncation and round-to-nearest-even are
+    both within 1 ULP, so checkAllclose passes either way. But residual_out feeds
+    the next layer, so a one-sided error compounds along the residual stream --
+    72 times for a 36-layer model -- and shows up as a train/inference logprob
+    gap in RL fine-tuning. Assert on the mean *signed* magnitude error instead.
+    """
+    dim = (m, n)
+    input = torch.randn(dim, dtype=dtype, device="cuda")
+    weight = torch.randn(n, dtype=dtype, device="cuda")
+    res = torch.randn(dim, dtype=dtype, device="cuda") * 30.0
+
+    (_, res_ref, *_), _ = run_torch(input, weight, 1e-5, residual=res)
+    (_, res_aiter, *_), _ = run_ck(input, weight, 1e-5, residual=res)
+
+    ref = res_ref.float()
+    got = res_aiter.float()
+    nz = ref != 0
+    # negative => magnitudes systematically shrunk toward zero (truncation)
+    bias = ((got.abs() - ref.abs()) / ref.abs().clamp_min(1e-30))[nz].mean().item()
+    tol = 1e-4
+    ok = abs(bias) < tol
+    print(
+        f"[bias] dim: {dim!s:<20}, dtype: {dtype}, residual_out mean signed "
+        f"magnitude error: {bias:+.3e} (tol {tol:.0e}) {'PASS' if ok else 'FAIL'}"
+    )
+    assert ok, (
+        f"residual_out rounding is biased ({bias:+.3e}); rounding must be "
+        f"unbiased or the error compounds across layers"
+    )
+
+
 # for dtype in [dtypes.fp16, dtypes.bf16]:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
@@ -168,3 +202,11 @@ for dtype in l_dtype:
     for m in l_m:
         for n in l_n:
             test_rmsnorm2d_fuseAdd(dtype, m, n)
+
+print("\nstart fuse add residual rounding-bias test")
+for dtype in l_dtype:
+    if dtype == dtypes.fp32:
+        continue  # fp32 residual_out is a straight copy, no narrowing
+    for m in l_m:
+        for n in l_n:
+            test_rmsnorm2d_fuseAdd_residual_unbiased(dtype, m, n)
