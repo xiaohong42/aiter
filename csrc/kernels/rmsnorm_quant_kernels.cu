@@ -114,7 +114,12 @@ __global__ void add_rmsnorm_quant_kernel(
                     thread_data_i = load_vector_nbytes<DTYPE_I, thread_data_size, load_chunk_bytes, load_aux, interleave, interleave_size>(buffer_input, row_offset);
                 }
 
-                store_vector<DTYPE_I, float, thread_data_size, load_aux, interleave, interleave_size, num_load_inst, DTYPE_I>(buffer_residual_out, thread_data_float, row_offset);
+                // residual_out feeds the next layer, so a one-sided rounding error on it
+                // compounds along the residual stream. Force round-to-nearest-even on the
+                // no-quant path, where it costs ~3-5%. The quantized path keeps the module
+                // default: RNE costs 11-31% there (the i8 add tile measured in #4080), and
+                // its output error already dominates a 0.5 ULP bf16 bias.
+                store_vector<DTYPE_I, float, thread_data_size, load_aux, interleave, interleave_size, num_load_inst, DTYPE_I, FUSE_QUANT ? OPUS_FP32_to_BF16_DEFAULT : 0>(buffer_residual_out, thread_data_float, row_offset);
                 
                 if constexpr(use_prefetch)
                 {

@@ -745,7 +745,8 @@ template <typename T,
           int aux                    = 0,
           bool interleave            = false,
           int interleave_thread_size = WARP_SIZE,
-          typename T_R               = T>
+          typename T_R               = T,
+          int store_rm               = OPUS_FP32_to_BF16_DEFAULT>
 __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
                                     const opus::vector_t<DTYPE_I, vec_size>& vec,
                                     int row_offset,
@@ -777,7 +778,16 @@ __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
                 opus::vector_t<T_R, chunk_size_elements> chunk_convert;
                 for(int j = 0; j < chunk_size_elements; j++)
                 {
-                    chunk_convert[j] = opus::cast<T_R>((*chunk_ptr)[j]);
+                    // only fp32->bf16 takes a rounding mode; fp32->fp16 uses the hw cvt
+                    if constexpr(std::is_same_v<T_R, opus::bf16_t>)
+                    {
+                        chunk_convert[j] =
+                            opus::cast<T_R>((*chunk_ptr)[j], opus::number<store_rm>{});
+                    }
+                    else
+                    {
+                        chunk_convert[j] = opus::cast<T_R>((*chunk_ptr)[j]);
+                    }
                 }
                 store_type& chunk_store = reinterpret_cast<store_type&>(chunk_convert);
                 store<store_chunk_size_elements>(
@@ -824,7 +834,8 @@ template <typename T,
           bool interleave            = false,
           int interleave_thread_size = WARP_SIZE,
           int num_repeat             = 1,
-          typename T_R               = T>
+          typename T_R               = T,
+          int store_rm               = OPUS_FP32_to_BF16_DEFAULT>
 __device__ void store_vector(opus::gmem<T>& buffer,
                              const opus::vector_t<DTYPE_I, vec_size>& vec,
                              int row_offset,
@@ -834,18 +845,39 @@ __device__ void store_vector(opus::gmem<T>& buffer,
     static constexpr index_t store_bytes      = vec_size * opus::sizeof_bits<T_R>::value / 8;   // total output bytes (logical type T_R)
     if constexpr((store_bytes / num_store_repeat) % 16 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 16, aux, interleave, interleave_thread_size, T_R>(
-            buffer, vec, row_offset, inverted_scale);
+        store_vector_nbytes<T,
+                            DTYPE_I,
+                            vec_size,
+                            16,
+                            aux,
+                            interleave,
+                            interleave_thread_size,
+                            T_R,
+                            store_rm>(buffer, vec, row_offset, inverted_scale);
     }
     else if constexpr((store_bytes / num_store_repeat) % 8 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 8, aux, interleave, interleave_thread_size, T_R>(
-            buffer, vec, row_offset, inverted_scale);
+        store_vector_nbytes<T,
+                            DTYPE_I,
+                            vec_size,
+                            8,
+                            aux,
+                            interleave,
+                            interleave_thread_size,
+                            T_R,
+                            store_rm>(buffer, vec, row_offset, inverted_scale);
     }
     else if constexpr((store_bytes / num_store_repeat) % 4 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 4, aux, interleave, interleave_thread_size, T_R>(
-            buffer, vec, row_offset, inverted_scale);
+        store_vector_nbytes<T,
+                            DTYPE_I,
+                            vec_size,
+                            4,
+                            aux,
+                            interleave,
+                            interleave_thread_size,
+                            T_R,
+                            store_rm>(buffer, vec, row_offset, inverted_scale);
     }
     else
     {
