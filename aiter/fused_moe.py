@@ -4184,6 +4184,10 @@ def _make_mxfp4_metadata(
 
 
 def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave=None):
+    # The MXFP8-activation (a8w4) stage-1 kernels take the gate/up-interleaved
+    # preshuffle only, whatever the weight tensor is tagged with.
+    if q_dtype_a == dtypes.fp8 and gate_mode != GateMode.INTERLEAVE:
+        return False
     if gate_up_interleave is not None:
         return (gate_up_interleave is False and gate_mode == GateMode.SEPARATED) or (
             gate_up_interleave is True and gate_mode == GateMode.INTERLEAVE

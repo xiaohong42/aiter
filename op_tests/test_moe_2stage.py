@@ -20,6 +20,7 @@ from aiter.fused_moe import (
     AsmMoeMode,
     _can_reroute_mxfp4_to_flydsl,
     _flydsl_route_output_nbytes,
+    _flydsl_stage1_wrapper,
     _is_flydsl_stage2,
     _stage2_runtime_uses_route_reduce,
     cktile_moe_stage1,
@@ -2639,6 +2640,54 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
     )
 
 
+def test_a8w4_mxfp4_separated_layout_dispatch():
+    """MXFP8-activation (a8w4) MXFP4 weights preshuffled with the standard gate/up
+    layout (w1.gate_up_interleave=False) must not take FlyDSL: its a8w4 stage-1
+    kernels read the gate/up-interleaved preshuffle only, and returned garbage for
+    these weights (cosine 0.005 against the reference at Qwen3-30B-A3B's TP2
+    shapes). Without a FlyDSL kernel they go to CK2stages, as untagged weights do."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info(
+            "skip a8w4 MXFP4 separated-layout dispatch test on %s", get_gfx()
+        )
+        return
+    model_dim, inter_dim, E, topk = 2048, 384, 128, 8
+    for gate_mode, gate_up_layout in (
+        (GateMode.INTERLEAVE, True),
+        (GateMode.SEPARATED, False),
+    ):
+        for token in (64, 1024, 8192):
+            metadata = get_2stage_cfgs(
+                get_padded_M(token),
+                model_dim,
+                inter_dim,
+                E,
+                topk,
+                torch.bfloat16,
+                dtypes.fp8,
+                dtypes.fp4x2,
+                aiter.QuantType.per_1x32,
+                True,
+                aiter.ActivationType.Silu,
+                False,
+                0,
+                0,
+                True,
+                gate_mode.value,
+                gate_up_interleave=gate_up_layout,
+            )
+            stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+            assert (stage1_func is _flydsl_stage1_wrapper) == (
+                gate_mode == GateMode.INTERLEAVE
+            ), (
+                f"{gate_mode=} {token=}: FlyDSL a8w4 stage1 takes gate/up-"
+                f"interleaved weights only, got {metadata.stage1!r}"
+            )
+    aiter.logger.info(
+        "moe_2stage: a8w4 MXFP4 separated-layout dispatch regression test passed"
+    )
+
+
 def _quant_blockscale_weight(w):
     e, n, k = w.shape
     blocks = w.view(e, n // 128, 128, k // 128, 128).permute(0, 1, 3, 2, 4).contiguous()
@@ -3236,6 +3285,7 @@ else:
     run_plain_fp8_limit_cases()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
+    test_a8w4_mxfp4_separated_layout_dispatch()
     test_swiglu_oai_flat_dispatch()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
