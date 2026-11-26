@@ -50,6 +50,8 @@ def torch_dynamic_mxfp4_quant(
         x: The input tensor, typically fp16 or bf16.
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round`.
+            - "ceil": 2^ceil(log2(max(amax, 6 * 2^-126) / 6)).
+            - "roundup": the same with the amax floored at 1e-10.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
@@ -89,7 +91,7 @@ def torch_dynamic_mxfp4_quant(
         qx = x_padded * (1.0 / scale_e4m3).unsqueeze(-1)
 
         block_scales = scale_e4m3.to(e4m3_dtype)
-    else:
+    elif scaling_mode == "even":
         amax = amax.view(torch.int32)
         amax = (amax + 0x200000) & 0xFF800000
         amax = amax.view(torch.float32)
@@ -102,6 +104,13 @@ def torch_dynamic_mxfp4_quant(
 
         # blockscale_e8m0
         block_scales = scale_e8m0_unbiased.to(torch.uint8) + 127
+    else:
+        amax_floor = {"ceil": 6 * 2**-126, "roundup": 1e-10}[scaling_mode]
+        scale_e8m0_unbiased = torch.ceil(
+            torch.log2(amax.double().clamp(min=amax_floor) / 6)
+        )
+        qx = x_padded * torch.exp2(-scale_e8m0_unbiased).float().unsqueeze(-1)
+        block_scales = (scale_e8m0_unbiased + 127).to(torch.uint8)
 
     # Convert to mxfp4 format
     #
@@ -253,20 +262,21 @@ def torch_dequant_nvfp4(
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_dynamic_mxfp4_quant(M: int, N: int, dtype):
+@pytest.mark.parametrize("scaling_mode", ["even", "ceil", "roundup"])
+def test_dynamic_mxfp4_quant(M: int, N: int, dtype, scaling_mode):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(20)
     x = torch.randn((M, N), dtype=dtype, device="cuda")
 
     logger.debug("x.shape=%s x=%s", x.shape, x)
 
-    triton_out, triton_scale = dynamic_mxfp4_quant(x)
+    triton_out, triton_scale = dynamic_mxfp4_quant(x, scaling_mode=scaling_mode)
     logger.debug("triton_out.shape=%s triton_out=%s", triton_out.shape, triton_out)
     logger.debug(
         "triton_scale.shape=%s triton_scale=%s", triton_scale.shape, triton_scale
     )
 
-    torch_out, torch_scale = torch_dynamic_mxfp4_quant(x)
+    torch_out, torch_scale = torch_dynamic_mxfp4_quant(x, scaling_mode=scaling_mode)
     logger.debug("torch_out.shape=%s torch_out=%s", torch_out.shape, torch_out)
     logger.debug("torch_scale.shape=%s torch_scale=%s", torch_scale.shape, torch_scale)
 
@@ -595,3 +605,54 @@ def test_dynamic_mxfp4_quant_gluon_matches_triton(M: int, N: int, dtype):
 
     torch.testing.assert_close(gluon_scale, triton_scale, atol=0, rtol=0)
     torch.testing.assert_close(gluon_out, triton_out, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("scaling_mode", ["ceil", "roundup"])
+def test_dynamic_mxfp4_quant_ceil_scales_edge_blocks(dtype, scaling_mode):
+    # One row, four 32-blocks: all zeros; amax 1e-12, below the "roundup" amax
+    # floor; amax 6 (scale 2^0, no rounding up) over the E2M1 ties; amax
+    # 6 * (1 + 2^-6), which rounds the scale up to 2^1.
+    ties = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0])
+    x = torch.cat(
+        [
+            torch.zeros(32),
+            torch.full((32,), 1e-12),
+            torch.cat([ties, -ties]).repeat(2),
+            torch.full((32,), 6 * (1 + 2**-6)),
+        ]
+    )
+    x = x.view(1, -1).to(device="cuda", dtype=dtype)
+
+    x_fp4, scales = dynamic_mxfp4_quant(x, scaling_mode=scaling_mode)
+
+    # 2^-126 or 2^-35 for the zero block; 2^-42 or 2^-35 for amax 1e-12.
+    expected_scales = (
+        [1, 85, 127, 128] if scaling_mode == "ceil" else [92, 92, 127, 128]
+    )
+    # Ties go to the even code: 0, 1, 1, 2, 2, 4, 4, then 6 exact (codes 0, 2,
+    # 2, 4, 4, 6, 6, 7; the sign is bit 3). 1e-12 / 2^-42 rounds to 4 (code 6),
+    # 1e-12 / 2^-35 to 0; 6.09375 / 2 rounds to 3 (code 5).
+    tie_bytes = [0x20, 0x42, 0x64, 0x76, 0xA8, 0xCA, 0xEC, 0xFE] * 2
+    tiny_byte = 0x66 if scaling_mode == "ceil" else 0x00
+    expected_fp4 = [0x00] * 16 + [tiny_byte] * 16 + tie_bytes + [0x55] * 16
+    assert scales.flatten().tolist() == expected_scales
+    assert x_fp4.flatten().tolist() == expected_fp4
+
+    torch_out, torch_scale = torch_dynamic_mxfp4_quant(x, scaling_mode=scaling_mode)
+    torch.testing.assert_close(scales, torch_scale, atol=0, rtol=0)
+    torch.testing.assert_close(x_fp4, torch_out, atol=0, rtol=0)
+
+
+def test_dynamic_mxfp4_quant_rejects_unknown_scaling_mode():
+    x = torch.randn((4, 64), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="scaling_mode must be one of"):
+        dynamic_mxfp4_quant(x, scaling_mode="nearest")
+
+
+@pytest.mark.parametrize("scaling_mode", ["ceil", "roundup"])
+def test_dynamic_mxfp4_quant_gluon_rejects_ceil_scales(scaling_mode):
+    # The Gluon kernels compute the "even" scale only.
+    x = torch.randn((4, 64), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="The Gluon backend requires"):
+        dynamic_mxfp4_quant(x, scaling_mode=scaling_mode, backend="gluon")

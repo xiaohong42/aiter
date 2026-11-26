@@ -43,6 +43,9 @@ __all__ = [
 _MXFP8_QUANT_BLOCK_SIZE = 32
 _MXFP8_LEGACY_BLOCK_SIZE = 128
 
+# scaling_mode -> SCALING_MODE of _mxfp4_quant_op.
+_MXFP4_SCALING_MODES = {"even": 0, "ceil": 1, "roundup": 2}
+
 
 _LOGGER = AiterTritonLogger()
 
@@ -218,6 +221,11 @@ def dynamic_mxfp4_quant(
             rounding currently supports bf16 and fp32.
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
+            - "ceil": 2^ceil(log2(amax / 6)), so no value saturates.
+            - "roundup": the scale of `per_1x32_f4_quant_hip`, "ceil" with the
+              block amax floored at 1e-10 as there.
+            The Gluon kernels compute "even" only, so "ceil" and "roundup" run
+            the Triton kernel. use_sr=True supports "even" only.
         x_fp4, blockscale_e8m0: Optional pre-allocated uint8 outputs, shaped
             (M, N // 2) and (M, ceil(N / 32)). N need not be a multiple of 32
             (only (N // 2) % 2 == 0 is asserted); a trailing partial block still
@@ -230,9 +238,10 @@ def dynamic_mxfp4_quant(
             disjoint counter ranges across launches that require independent
             rounding noise. One counter supplies four packed E2M1 pairs.
         backend: None picks the Gluon kernel where supported (gfx950 with bf16
-            input and ``use_sr=False``, or gfx1250) and the Triton kernel
-            elsewhere. "triton" or "gluon" forces that kernel; "gluon" raises
-            RuntimeError where unsupported.
+            input and ``use_sr=False``, or gfx1250, both with
+            ``scaling_mode="even"``) and the Triton kernel elsewhere. "triton"
+            or "gluon" forces that kernel; "gluon" raises RuntimeError where
+            unsupported.
 
     Returns:
         A tuple ``(x_fp4, blockscale_e8m0)``. The payload has shape
@@ -242,16 +251,22 @@ def dynamic_mxfp4_quant(
     Raises:
         TypeError: If stochastic rounding receives an unsupported dtype or
             non-integer Philox argument.
-        ValueError: If stochastic-rounding arguments or shape are invalid, or
-            ``backend`` is unknown.
+        ValueError: If ``scaling_mode`` or ``backend`` is unknown, or
+            stochastic-rounding arguments or shape are invalid.
         RuntimeError: If stochastic rounding is requested outside gfx950, or
             ``backend="gluon"`` is not supported for this call.
 
     By default, gfx950 with bf16 input (and use_sr=False) uses a Gluon kernel
     with the native hw-cvt instruction, and gfx1250 uses a TDM Gluon kernel;
-    other dtypes/archs, and any use_sr=True call, use the plain Triton kernel.
+    other dtypes/archs, any use_sr=True call and the "ceil" and "roundup"
+    scaling modes use the plain Triton kernel.
     """
     _LOGGER.info("DYNAMIC_MXFP4_QUANT: x=%s use_sr=%s", tuple(x.shape), use_sr)
+    if scaling_mode not in _MXFP4_SCALING_MODES:
+        raise ValueError(
+            f"scaling_mode must be one of {tuple(_MXFP4_SCALING_MODES)}, "
+            f"got {scaling_mode!r}"
+        )
     if use_sr and x.dim() != 2:
         raise ValueError(f"use_sr=True requires a 2-D tensor, got {x.dim()} dimensions")
     # Assume x is 2D-Tensor for now
@@ -315,9 +330,10 @@ def dynamic_mxfp4_quant(
             and blockscale_e8m0.dtype == torch.uint8
         )
 
-    # Every gfx1250 input has a Gluon kernel; the call only validates `backend`.
+    even_scale = scaling_mode == "even"
+    # Every gfx1250 input has a Gluon kernel for the "even" scale.
     if arch_info.get_arch() in ("gfx1250", "gfx1250-strict") and _use_gluon(
-        backend, True, "gfx1250"
+        backend, even_scale, "scaling_mode='even'"
     ):
         from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
             gluon_dynamic_mxfp4_quant_kernel_gfx1250,
@@ -351,15 +367,17 @@ def dynamic_mxfp4_quant(
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             num_warps=NUM_WARPS,
         )
-    # The gfx950 Gluon kernel only supports bf16 (hw-cvt) and no use_sr;
-    # everything else uses the Triton path below.
+    # The gfx950 Gluon kernel only supports bf16 (hw-cvt), no use_sr and the
+    # "even" scale; everything else uses the Triton path below.
     elif _use_gluon(
         backend,
         arch_info.get_arch() == "gfx950"
         and x.dtype == torch.bfloat16
         and not use_sr
+        and even_scale
         and _has_scaled_downcast(),
-        "gfx950, bf16 input, use_sr=False and Triton gl.amd.cdna4.scaled_downcast",
+        "gfx950, bf16 input, use_sr=False, scaling_mode='even' and Triton "
+        "gl.amd.cdna4.scaled_downcast",
     ):
         from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
             gluon_dynamic_mxfp4_quant_kernel_gfx950,
@@ -444,7 +462,7 @@ def dynamic_mxfp4_quant(
             philox_offset=philox_offset,
             MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
             EVEN_M_N=even_m_n,
-            SCALING_MODE=0,
+            SCALING_MODE=_MXFP4_SCALING_MODES[scaling_mode],
             USE_SR=use_sr,
             NUM_ITER=NUM_ITER,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
