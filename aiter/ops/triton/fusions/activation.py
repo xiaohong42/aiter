@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.fusions.activation import (
     _silu_and_mul_backward_kernel,
     fused_silu_mul_kernel,
 )
+from aiter.ops.triton.quant.quant import _MXFP4_SCALING_MODES
 from aiter.ops.triton.utils.config_utils import (
     load_config_json,
     resolve_config_dir,
@@ -21,9 +22,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 fp8_dtype = aiter.dtypes.fp8
 
 _LOGGER = AiterTritonLogger()
-
-# scaling_mode -> SCALING_MODE of _mxfp4_quant_op.
-_MXFP4_SCALING_MODES = {"even": 0, "ceil": 1, "roundup": 2}
 
 
 def _get_silu_and_mul_backward_config(n_cols: int) -> dict:

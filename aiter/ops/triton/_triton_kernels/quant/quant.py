@@ -676,6 +676,7 @@ def _dynamic_mxfp4_quant_kernel(
             x_ptr.type.element_ty == tl.float32 or x_ptr.type.element_ty == tl.bfloat16
         )
         tl.static_assert(BLOCK_SIZE_N % MXFP4_QUANT_BLOCK_SIZE == 0)
+        tl.static_assert(SCALING_MODE == 0, "USE_SR needs SCALING_MODE=0")
 
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
@@ -746,7 +747,7 @@ def _dynamic_mxfp4_quant_kernel(
                 )
 
             out_tensor, bs_e8m0 = _mxfp4_quant_op(
-                x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+                x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE, SCALING_MODE
             )
 
         out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
